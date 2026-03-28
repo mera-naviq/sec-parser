@@ -72,7 +72,8 @@ FILING_STATUS = {
     "EXTRACTING": "extracting",
     "PARSING": "parsing",
     "VALIDATING": "validating",
-    "COMPLETE": "complete",
+    "OK": "ok",
+    "PARTIAL": "partial",
     "FAILED": "failed",
 }
 

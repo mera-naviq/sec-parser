@@ -129,7 +129,7 @@ async def _run_single_filing(url: str):
             holdings_count=result.holdings_count,
             confidence_score=result.confidence_score,
         )
-        click.echo(f"\n✓ Success: {result.holdings_count} holdings extracted")
+        click.echo(f"\n[OK] Success: {result.holdings_count} holdings extracted")
         click.echo(f"  Filing ID: {result.filing_id}")
         click.echo(f"  Confidence: {result.confidence_score:.1f}%")
 
@@ -262,7 +262,7 @@ async def _show_status():
 
     total = 0
     for status, count in sorted(summary.items()):
-        icon = "✓" if status == "complete" else "✗" if status == "failed" else "○"
+        icon = "[OK]" if status == "ok" else "[FAIL]" if status == "failed" else "[...]"
         click.echo(f"  {icon} {status}: {count}")
         total += count
 

@@ -355,7 +355,7 @@ class PipelineOrchestrator:
             ]
 
             await self.db.update_filing(filing_id, {
-                "status": FILING_STATUS["COMPLETE"],
+                "status": FILING_STATUS["OK"],
                 "confidence_score": validation_result.confidence_score,
                 "extraction_warnings": json.dumps(warnings_json),
             })
