@@ -5,12 +5,16 @@ Provides both CLI and FastAPI health check endpoint for Railway.
 
 import asyncio
 import sys
-from typing import Optional
+import uuid
+from typing import Optional, List
+from datetime import datetime
 
 import click
 import structlog
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from uvicorn import Config, Server
 
 # Load environment variables
@@ -36,8 +40,39 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-# FastAPI app for health checks
+# FastAPI app for health checks and parse API
 app = FastAPI(title="SEC Parser Elite")
+
+# Add CORS middleware for dashboard access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, restrict to your dashboard domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory job tracking (for simplicity - could use Redis for persistence)
+parse_jobs: dict = {}
+
+
+# Pydantic models for API
+class ParseRequest(BaseModel):
+    urls: List[str]
+    concurrency: int = 3
+
+
+class ParseJobStatus(BaseModel):
+    job_id: str
+    status: str  # pending, running, completed, failed
+    total: int
+    completed: int
+    failed: int
+    current_url: Optional[str] = None
+    results: List[dict] = []
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error: Optional[str] = None
 
 
 @app.get("/health")
@@ -53,6 +88,129 @@ async def health_check():
         return {"status": "ok", "db": "connected" if db_ok else "error"}
     except Exception as e:
         return {"status": "error", "db": str(e)}
+
+
+@app.post("/parse")
+async def start_parse_job(request: ParseRequest, background_tasks: BackgroundTasks):
+    """Start a new parsing job for multiple URLs."""
+    if not request.urls:
+        raise HTTPException(status_code=400, detail="No URLs provided")
+
+    # Filter valid URLs
+    valid_urls = [url.strip() for url in request.urls if url.strip().startswith("http")]
+    if not valid_urls:
+        raise HTTPException(status_code=400, detail="No valid URLs found")
+
+    # Create job
+    job_id = str(uuid.uuid4())[:8]
+    parse_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "total": len(valid_urls),
+        "completed": 0,
+        "failed": 0,
+        "current_url": None,
+        "results": [],
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "urls": valid_urls,
+        "concurrency": min(request.concurrency, 5),  # Cap at 5
+    }
+
+    # Start background processing
+    background_tasks.add_task(run_parse_job, job_id)
+
+    return {"job_id": job_id, "total_urls": len(valid_urls), "status": "pending"}
+
+
+@app.get("/parse/{job_id}")
+async def get_parse_job_status(job_id: str):
+    """Get the status of a parsing job."""
+    if job_id not in parse_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = parse_jobs[job_id]
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "total": job["total"],
+        "completed": job["completed"],
+        "failed": job["failed"],
+        "current_url": job["current_url"],
+        "results": job["results"],
+        "started_at": job["started_at"],
+        "completed_at": job["completed_at"],
+        "error": job["error"],
+    }
+
+
+@app.get("/parse")
+async def list_parse_jobs():
+    """List all parsing jobs."""
+    return {
+        "jobs": [
+            {
+                "job_id": job["job_id"],
+                "status": job["status"],
+                "total": job["total"],
+                "completed": job["completed"],
+                "failed": job["failed"],
+                "started_at": job["started_at"],
+                "completed_at": job["completed_at"],
+            }
+            for job in parse_jobs.values()
+        ]
+    }
+
+
+async def run_parse_job(job_id: str):
+    """Background task to run the parsing job."""
+    from pipeline import PipelineOrchestrator
+
+    job = parse_jobs[job_id]
+    job["status"] = "running"
+    job["started_at"] = datetime.utcnow().isoformat()
+
+    try:
+        async with PipelineOrchestrator() as pipeline:
+            for i, url in enumerate(job["urls"]):
+                job["current_url"] = url
+
+                try:
+                    result = await pipeline.run_filing(url)
+
+                    if result.success:
+                        job["completed"] += 1
+                        job["results"].append({
+                            "url": url,
+                            "status": "ok",
+                            "filing_id": str(result.filing_id),
+                            "holdings_count": result.holdings_count,
+                            "confidence_score": result.confidence_score,
+                        })
+                    else:
+                        job["failed"] += 1
+                        job["results"].append({
+                            "url": url,
+                            "status": "failed",
+                            "error": result.error,
+                        })
+                except Exception as e:
+                    job["failed"] += 1
+                    job["results"].append({
+                        "url": url,
+                        "status": "failed",
+                        "error": str(e),
+                    })
+
+        job["status"] = "completed"
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = str(e)
+    finally:
+        job["current_url"] = None
+        job["completed_at"] = datetime.utcnow().isoformat()
 
 
 @click.group()
