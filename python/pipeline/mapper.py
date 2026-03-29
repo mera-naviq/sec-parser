@@ -40,7 +40,7 @@ class MappedHolding:
     moic: Optional[float] = None
     raw_textract_row: Optional[Dict[str, Any]] = None
     extraction_source: str = "textract"
-    confidence: str = "high"
+    confidence: float = 1.0  # 0.0-1.0 scale
 
 
 class DataMapper:
@@ -303,13 +303,13 @@ class DataMapper:
         if cost and cost > 0:
             moic = fair_value / cost
 
-        # Determine confidence
-        confidence = "high"
+        # Determine confidence (0.0-1.0 scale)
+        confidence = 1.0
         if validation_result:
             if validation_result.get("issue"):
-                confidence = "low"
+                confidence = 0.5
             elif validation_result.get("warning"):
-                confidence = "medium"
+                confidence = 0.75
 
         return MappedHolding(
             holding_name=clean_name,
