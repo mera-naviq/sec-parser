@@ -77,7 +77,13 @@ class ParseJobStatus(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for Railway."""
+    """Health check endpoint for Railway - simple and fast."""
+    return {"status": "ok"}
+
+
+@app.get("/health/db")
+async def health_check_db():
+    """Deep health check including database connectivity."""
     from db import SupabaseClient
 
     db = SupabaseClient()
