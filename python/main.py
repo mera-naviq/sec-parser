@@ -81,19 +81,51 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/health/imports")
+async def health_check_imports():
+    """Test if all modules can be imported."""
+    results = {}
+
+    # Test config import
+    try:
+        from config import get_settings
+        settings = get_settings()
+        results["config"] = "ok"
+    except Exception as e:
+        results["config"] = f"error: {e}"
+
+    # Test db import
+    try:
+        from db import SupabaseClient
+        results["db"] = "ok"
+    except Exception as e:
+        results["db"] = f"error: {e}"
+
+    # Test pipeline import
+    try:
+        from pipeline import PipelineOrchestrator
+        results["pipeline"] = "ok"
+    except Exception as e:
+        results["pipeline"] = f"error: {e}"
+
+    return {"imports": results}
+
+
 @app.get("/health/db")
 async def health_check_db():
     """Deep health check including database connectivity."""
-    from db import SupabaseClient
-
-    db = SupabaseClient()
     try:
+        from db import SupabaseClient
+        db = SupabaseClient()
         await db.connect()
         db_ok = await db.health_check()
         await db.close()
         return {"status": "ok", "db": "connected" if db_ok else "error"}
     except Exception as e:
-        return {"status": "error", "db": str(e)}
+        import traceback
+        error_tb = traceback.format_exc()
+        logger.error("Database health check failed", error=str(e), traceback=error_tb)
+        return {"status": "error", "db": str(e), "traceback": error_tb}
 
 
 @app.post("/parse")
