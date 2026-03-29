@@ -108,7 +108,7 @@ async def health_check_db():
     except Exception as e:
         import traceback
         error_tb = traceback.format_exc()
-        logger.error("Database health check failed", error=str(e), traceback=error_tb)
+        logger.error(f"Database health check failed: {e}")
         return {"status": "error", "db": str(e), "traceback": error_tb}
 
 
