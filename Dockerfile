@@ -46,4 +46,5 @@ COPY python/ ./
 EXPOSE 8000
 
 # Default command - start health check server
-CMD ["python", "main.py", "serve", "--port", "8000"]
+# Railway sets PORT env var, default to 8000 for local dev
+CMD ["sh", "-c", "python main.py serve --port ${PORT:-8000}"]
