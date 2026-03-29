@@ -53,21 +53,18 @@ class PipelineOrchestrator:
         if self.db:
             await self.db.close()
 
-    async def run_filing(self, url: str) -> PipelineResult:
+    async def run_filing(self, url: str, extraction_strategy: str = "claude_only") -> PipelineResult:
         """
         Run the full pipeline on a single filing.
 
-        Steps:
-        1. EDGAR Fetch - Get filing HTML
-        2. HTML → PDF Conversion
-        3. Textract Table Extraction
-        4. Claude Batch Processing
-        5. Parse & Map
-        6. Validate & Score
-        7. Write to Supabase
+        Strategies:
+        - textract_primary: Textract for tables + Claude for validation (original)
+        - claude_only: Claude extracts everything from HTML (cheapest, most accurate)
+        - hybrid: Claude for holdings, Textract for financial statements
 
         Args:
             url: SEC filing URL
+            extraction_strategy: One of "textract_primary", "claude_only", "hybrid"
 
         Returns:
             PipelineResult with success status and metrics
@@ -76,7 +73,7 @@ class PipelineOrchestrator:
 
         try:
             # Step 1: EDGAR Fetch
-            logger.info("Step 1: Fetching filing from EDGAR", url=url)
+            logger.info("Step 1: Fetching filing from EDGAR", url=url, strategy=extraction_strategy)
 
             async with EdgarFetcher() as fetcher:
                 filing_data = await fetcher.fetch_and_parse(url)
@@ -96,78 +93,81 @@ class PipelineOrchestrator:
                 status=FILING_STATUS["FETCHING"],
             )
 
-            # Upload HTML to S3
-            s3_html_key = f"raw/{cik}/{accession_number.replace('-', '')}/filing.html"
-            # TODO: Implement S3 upload for HTML
-
-            # Update status
-            await self.db.update_filing_status(filing_id, FILING_STATUS["CONVERTING"])
-
-            # Step 2: HTML → PDF Conversion
-            logger.info("Step 2: Converting HTML to PDF")
-
-            use_claude_only = False
-            pdf_bytes = None
-            pdf_page_count = 0
-
-            async with HtmlToPdfConverter() as converter:
-                pdf_bytes, pdf_page_count, exceeded_max = await converter.convert_with_fallback(
-                    html, url
-                )
-
-                if exceeded_max or pdf_bytes is None:
-                    use_claude_only = True
-                    logger.info(
-                        "Using Claude-only extraction",
-                        reason="PDF too large or conversion failed",
-                        page_count=pdf_page_count,
-                    )
-
-            # Step 3: Textract Table Extraction (if PDF available)
-            logger.info("Step 3: Textract extraction")
-
+            # Initialize extraction variables
             schedule_rows = []
             subtotals = []
             section_headers = []
             financial_tables = {}
-            textract_job_id = None
+            pdf_bytes = None
 
-            if pdf_bytes and not use_claude_only:
+            # Step 2: PDF Conversion (only if needed for Textract)
+            use_textract_for_holdings = extraction_strategy == "textract_primary"
+            use_textract_for_financials = extraction_strategy in ["textract_primary", "hybrid"]
+
+            if use_textract_for_holdings or use_textract_for_financials:
+                await self.db.update_filing_status(filing_id, FILING_STATUS["CONVERTING"])
+                logger.info("Step 2: Converting HTML to PDF")
+
+                try:
+                    async with HtmlToPdfConverter() as converter:
+                        pdf_bytes, pdf_page_count, exceeded_max = await converter.convert_with_fallback(
+                            html, url
+                        )
+
+                        if exceeded_max or pdf_bytes is None:
+                            logger.info(
+                                "PDF conversion failed or too large, falling back",
+                                page_count=pdf_page_count,
+                            )
+                            # Fallback: disable Textract usage
+                            use_textract_for_holdings = False
+                            if extraction_strategy == "textract_primary":
+                                use_textract_for_financials = False
+                except Exception as e:
+                    logger.warning(f"PDF conversion failed: {e}, continuing without Textract")
+                    use_textract_for_holdings = False
+                    use_textract_for_financials = False
+
+            # Step 3: Textract Extraction (if applicable)
+            if pdf_bytes and (use_textract_for_holdings or use_textract_for_financials):
                 await self.db.update_filing_status(filing_id, FILING_STATUS["EXTRACTING"])
+                logger.info("Step 3: Textract extraction", for_holdings=use_textract_for_holdings, for_financials=use_textract_for_financials)
 
                 s3_pdf_key = f"raw/{cik}/{accession_number.replace('-', '')}/filing.pdf"
                 extractor = TextractExtractor()
 
-                extraction_result = await extractor.extract(pdf_bytes, s3_pdf_key)
+                try:
+                    extraction_result = await extractor.extract(pdf_bytes, s3_pdf_key)
 
-                schedule_rows = extraction_result.schedule_rows
-                subtotals = extraction_result.subtotals
-                section_headers = extraction_result.section_headers
-                financial_tables = extraction_result.financial_tables
+                    if use_textract_for_holdings:
+                        schedule_rows = extraction_result.schedule_rows
+                        subtotals = extraction_result.subtotals
+                        section_headers = extraction_result.section_headers
 
-                # Store PDF S3 key
-                await self.db.update_filing(filing_id, {
-                    "raw_pdf_s3_key": s3_pdf_key,
-                    "textract_job_id": textract_job_id,
-                })
+                    if use_textract_for_financials:
+                        financial_tables = extraction_result.financial_tables
+
+                    await self.db.update_filing(filing_id, {"raw_pdf_s3_key": s3_pdf_key})
+                except Exception as e:
+                    logger.warning(f"Textract extraction failed: {e}, continuing with Claude-only")
+                    use_textract_for_holdings = False
+            else:
+                logger.info("Step 3: Skipping Textract (using Claude-only for holdings)")
 
             # Step 4: Claude Batch Processing
             logger.info("Step 4: Claude batch processing")
-
             await self.db.update_filing_status(filing_id, FILING_STATUS["PARSING"])
 
             async with ClaudeBatchProcessor() as claude:
-                # Build batch requests
                 batch_requests = []
 
-                # Request 1: Cover page metadata
+                # Always: Cover page metadata
                 batch_requests.append({
                     "custom_id": "cover_page_metadata",
                     "prompt": PromptTemplates.cover_page_metadata(html[:3000]),
                 })
 
-                # Request 2: Footnotes
-                # Find footnotes section in HTML
+                # Always: Footnotes
                 footnotes_html = self._extract_footnotes_section(html)
                 if footnotes_html:
                     batch_requests.append({
@@ -175,7 +175,7 @@ class PipelineOrchestrator:
                         "prompt": PromptTemplates.footnotes(footnotes_html[:10000]),
                     })
 
-                # Request 3: Notes to Financial Statements
+                # Always: Notes to Financial Statements
                 notes_html = self._extract_notes_section(html)
                 if notes_html:
                     batch_requests.append({
@@ -183,7 +183,7 @@ class PipelineOrchestrator:
                         "prompt": PromptTemplates.notes_financial_statements(notes_html[:20000]),
                     })
 
-                # Request 4: Financial statements (from Textract or HTML)
+                # Financial statements (from Textract if hybrid/textract_primary, else from HTML via Claude)
                 if financial_tables:
                     tables_text = json.dumps(financial_tables, indent=2)
                     batch_requests.append({
@@ -191,8 +191,9 @@ class PipelineOrchestrator:
                         "prompt": PromptTemplates.financial_statements(tables_text[:15000]),
                     })
 
-                # Request 5: Schedule validation (if we have Textract data)
-                if schedule_rows:
+                # Holdings extraction strategy
+                if use_textract_for_holdings and schedule_rows:
+                    # Textract primary: use Claude for validation only
                     batch_requests.append({
                         "custom_id": "schedule_validation",
                         "prompt": PromptTemplates.schedule_validation(
@@ -201,9 +202,8 @@ class PipelineOrchestrator:
                             json.dumps(section_headers, indent=2),
                         ),
                     })
-
-                # If using Claude-only extraction
-                if use_claude_only:
+                else:
+                    # Claude-only or hybrid: Claude extracts holdings directly from HTML
                     batch_requests.append({
                         "custom_id": "full_schedule_extraction",
                         "prompt": PromptTemplates.full_schedule_extraction(html),
@@ -218,17 +218,13 @@ class PipelineOrchestrator:
 
                 responses = await claude.process_batch_with_retry(requests)
 
-                # Store batch ID
-                # await self.db.update_filing(filing_id, {"claude_batch_id": batch_id})
-
             # Step 5: Parse & Map
             logger.info("Step 5: Parsing and mapping")
 
-            # Parse Claude responses
+            # Parse metadata
             metadata = None
             if "cover_page_metadata" in responses and responses["cover_page_metadata"]:
                 metadata = ClaudeResponseParser.parse_metadata(responses["cover_page_metadata"])
-                # Update filing with better metadata if available
                 if metadata.fund_name:
                     await self.db.update_filing(filing_id, {
                         "fund_name": metadata.fund_name,
@@ -238,37 +234,41 @@ class PipelineOrchestrator:
                         "period_label": metadata.period_label,
                     })
 
+            # Parse footnotes
             footnotes_list = []
             footnotes_dict = {}
             if "footnotes" in responses and responses["footnotes"]:
                 footnotes_list = ClaudeResponseParser.parse_footnotes(responses["footnotes"])
                 footnotes_dict = {f.footnote_id: f.text for f in footnotes_list}
 
+            # Parse notes
             notes_data = {}
             if "notes_financial_statements" in responses and responses["notes_financial_statements"]:
                 notes_data = ClaudeResponseParser.parse_notes_financial_statements(
                     responses["notes_financial_statements"]
                 )
 
+            # Parse financial statements
             fin_statements = {}
             if "financial_statements" in responses and responses["financial_statements"]:
                 fin_statements = ClaudeResponseParser.parse_financial_statements(
                     responses["financial_statements"]
                 )
 
+            # Parse holdings based on strategy
             validation_data = None
             if "schedule_validation" in responses and responses["schedule_validation"]:
                 validation_data = ClaudeResponseParser.parse_validation(
                     responses["schedule_validation"]
                 )
 
-            # If Claude-only extraction
-            if use_claude_only and "full_schedule_extraction" in responses:
+            if "full_schedule_extraction" in responses and responses["full_schedule_extraction"]:
                 claude_schedule = ClaudeResponseParser.parse_full_schedule(
                     responses["full_schedule_extraction"]
                 )
                 schedule_rows = claude_schedule["holdings"]
                 subtotals = claude_schedule["subtotals"]
+                logger.info(f"Claude extracted {len(schedule_rows)} holdings")
 
             # Map holdings
             validation_results = validation_data.misaligned_rows if validation_data else None

@@ -40,10 +40,18 @@ app.add_middleware(
 parse_jobs: dict = {}
 
 
+# Extraction strategy options
+class ExtractionStrategy(str):
+    TEXTRACT_PRIMARY = "textract_primary"  # Textract + Claude validation (original)
+    CLAUDE_ONLY = "claude_only"            # Claude-only extraction (cheapest, most accurate)
+    HYBRID = "hybrid"                      # Claude for holdings, Textract for financials
+
+
 # Pydantic models for API
 class ParseRequest(BaseModel):
     urls: List[str]
     concurrency: int = 3
+    extraction_strategy: str = "claude_only"  # Default to most accurate/cheapest
 
 
 class ParseJobStatus(BaseModel):
@@ -123,6 +131,10 @@ async def start_parse_job(request: ParseRequest, background_tasks: BackgroundTas
     if not valid_urls:
         raise HTTPException(status_code=400, detail="No valid URLs found")
 
+    # Validate extraction strategy
+    valid_strategies = ["textract_primary", "claude_only", "hybrid"]
+    strategy = request.extraction_strategy if request.extraction_strategy in valid_strategies else "claude_only"
+
     # Create job
     job_id = str(uuid.uuid4())[:8]
     parse_jobs[job_id] = {
@@ -138,6 +150,7 @@ async def start_parse_job(request: ParseRequest, background_tasks: BackgroundTas
         "error": None,
         "urls": valid_urls,
         "concurrency": min(request.concurrency, 5),  # Cap at 5
+        "extraction_strategy": strategy,
     }
 
     # Start background processing
@@ -193,6 +206,7 @@ async def run_parse_job(job_id: str):
     job = parse_jobs[job_id]
     job["status"] = "running"
     job["started_at"] = datetime.utcnow().isoformat()
+    extraction_strategy = job.get("extraction_strategy", "claude_only")
 
     try:
         async with PipelineOrchestrator() as pipeline:
@@ -200,7 +214,7 @@ async def run_parse_job(job_id: str):
                 job["current_url"] = url
 
                 try:
-                    result = await pipeline.run_filing(url)
+                    result = await pipeline.run_filing(url, extraction_strategy=extraction_strategy)
 
                     if result.success:
                         job["completed"] += 1

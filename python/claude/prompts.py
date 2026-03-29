@@ -240,10 +240,14 @@ SECTION HEADERS:
     @staticmethod
     def full_schedule_extraction(html: str) -> str:
         """
-        Fallback prompt for Claude-only extraction when Textract can't be used.
-        Used for very large documents or when PDF conversion fails.
+        Primary prompt for Claude-based holdings extraction.
+        Designed to accurately distinguish individual holdings from summary tables.
         """
         return f"""Extract the complete Schedule of Investments from this SEC N-CSR filing.
+
+CRITICAL: You must distinguish between:
+1. INDIVIDUAL HOLDINGS (what we want): Specific fund names like "Advent International GPE X", "Apollo Investment Fund IX", "Berkshire Fund IX, L.P."
+2. SUMMARY/ALLOCATION TABLES (skip these): Categories like "Buyouts", "Venture Capital", "United States", "Europe", "Asia" - these are aggregates, NOT holdings
 
 Return ONLY valid JSON with no preamble, no markdown code fences, no explanation.
 
@@ -251,7 +255,7 @@ Expected JSON schema:
 {{
     "holdings": [
         {{
-            "holding_name": "string - Name of the investment (e.g., 'Berkshire Fund IX, L.P.')",
+            "holding_name": "string - SPECIFIC fund/investment name (e.g., 'Berkshire Fund IX, L.P.', 'Apollo Overseas Partners IX')",
             "investment_type": "string or null - Primary, Secondary, Co-Investment, Direct",
             "investment_purpose": "string or null - Buyouts, Venture Capital, Debt/Credit, Growth Equity, etc.",
             "geographic_region": "string or null - North America, Europe, Asia-Pacific, etc.",
@@ -259,9 +263,9 @@ Expected JSON schema:
             "maturity_date": "string or null - Date in YYYY-MM-DD format (for debt)",
             "cost": "number or null - Original cost in USD",
             "fair_value": "number - Current fair value in USD (required)",
-            "footnote_refs": ["string"] - Array of footnote references like ['3', '14', '*'],
+            "footnote_refs": ["string"] - Array of footnote references like ['3', '14', '*', 'a', 'd'],
             "is_restricted": "boolean - true if marked with asterisk or restricted notation",
-            "section_name": "string or null - e.g., 'Primary Investments', 'Secondary Investments'"
+            "section_name": "string or null - e.g., 'Primary Investments', 'Secondary Investments', 'Direct Co-Investments'"
         }}
     ],
 
@@ -277,14 +281,28 @@ Expected JSON schema:
     "value_scale": "string - 'actual' if values in dollars, 'thousands' if in thousands, 'millions' if in millions"
 }}
 
-IMPORTANT RULES:
-1. Look for indicators like "Amounts in USD", "(in thousands)", "(000s)" to determine value_scale
-2. If values are in thousands, still report them as-is - we will multiply later
-3. fair_value is REQUIRED for each holding - skip rows without a fair value
-4. Skip header rows, subtotal rows (extract those separately), and blank rows
-5. Skip rows that are section headers like "Primary Investments - 2.3%"
-6. If a value is not present, use null. Do not guess or hallucinate values.
-7. Extract ALL holdings - there may be hundreds
+CRITICAL RULES:
+1. ONLY extract rows that represent SPECIFIC NAMED INVESTMENTS (fund names, LP names, company names)
+2. DO NOT extract rows from summary tables like:
+   - "Investment Purpose Allocation" (Buyouts, Venture Capital, Growth, etc.)
+   - "Geographic Allocation" (United States, Europe, Asia, etc.)
+   - "Industry Classification" tables
+   - Any table that shows totals BY CATEGORY rather than individual holdings
+3. Holdings have SPECIFIC NAMES like:
+   - "EQT X CO-INVESTMENT (K) SCSP"
+   - "Advent International GPE X-D SCSp"
+   - "Blackstone Capital Partners VIII L.P."
+   - "Carlyle Partners VII, L.P."
+4. Holdings DO NOT have generic names like:
+   - "Buyouts" (this is a category)
+   - "United States" (this is a geography)
+   - "Venture Capital" (this is a purpose)
+5. Look for the main "Schedule of Investments" or "Consolidated Schedule of Investments" table
+6. The Schedule typically has columns: Investment/Description, Geographic Region, Acquisition Date, Cost, Fair Value, % of NAV, Footnotes
+7. fair_value is REQUIRED for each holding - skip rows without a fair value
+8. If a value is not present, use null. Do not guess or hallucinate values.
+9. Extract ALL individual holdings - there may be dozens to hundreds
+10. Look for indicators like "(in thousands)", "(000s)" to determine value_scale
 
 Document:
-{html[:100000]}"""
+{html[:120000]}"""
